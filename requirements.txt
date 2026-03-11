@@ -1,5 +1,5 @@
-python-telegram-bot
+python-telegram-bot[webhooks]==22.6
 requests
 python-dotenv
-httpx
 httpcore
+httpx
