@@ -4,6 +4,7 @@
 import os
 import logging
 import requests
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,6 +17,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 UPTIME_API_KEY = os.getenv('UPTIME_API_KEY')
 UPTIME_API_URL = 'https://api.uptimerobot.com/v2'
+PORT = int(os.getenv('PORT', 8080))
 
 # Configurar logging
 logging.basicConfig(
@@ -23,6 +25,14 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Verificar configuración
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_TOKEN no está configurado!")
+    exit(1)
+if not UPTIME_API_KEY:
+    logger.error("UPTIME_API_KEY no está configurada!")
+    exit(1)
 
 # ===== FUNCIONES AUXILIARES =====
 def get_status_emoji(status):
@@ -355,16 +365,23 @@ async def show_help(query, context):
     )
     await query.edit_message_text(help_text, parse_mode='Markdown', reply_markup=create_back_button())
 
+async def post_init(application: Application):
+    """Función que se ejecuta después de inicializar la aplicación"""
+    logger.info("🤖 Bot iniciado correctamente!")
+    logger.info("📱 Busca tu bot en Telegram")
+    logger.info("🛑 Presiona Ctrl+C para detener")
+
 def main():
     """Función principal"""
     try:
-        # Verificar variables de entorno
-        if not TELEGRAM_TOKEN or not UPTIME_API_KEY:
-            logger.error("Faltan variables de entorno. Crea un archivo .env con TELEGRAM_TOKEN y UPTIME_API_KEY")
-            return
-        
-        # Crear la aplicación
-        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        # Crear la aplicación con configuración optimizada para producción
+        application = (
+            Application.builder()
+            .token(TELEGRAM_TOKEN)
+            .post_init(post_init)
+            .concurrent_updates(True)
+            .build()
+        )
         
         # Handlers
         application.add_handler(CommandHandler("start", start))
@@ -372,12 +389,14 @@ def main():
         application.add_handler(CallbackQueryHandler(confirm_delete, pattern='^confirm_delete_'))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        logger.info("🤖 Bot iniciado correctamente!")
-        logger.info("📱 Busca tu bot en Telegram")
-        logger.info("🛑 Presiona Ctrl+C para detener")
-        
-        # Iniciar el bot
-        application.run_polling()
+        # Iniciar el bot con webhook para producción (Render)
+        # En producción usamos webhook en lugar de polling
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TELEGRAM_TOKEN}"
+        )
         
     except Exception as e:
         logger.error(f"Error al iniciar: {e}")
