@@ -8,6 +8,10 @@ import threading
 import time
 import json
 import sqlite3
+import subprocess
+import socket
+import ssl
+import whois
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,7 +26,9 @@ UPTIME_API_KEY = os.getenv('UPTIME_API_KEY')
 UPTIME_API_URL = 'https://api.uptimerobot.com/v2'
 PORT = int(os.getenv('PORT', 8080))
 RENDER_URL = os.getenv('RENDER_EXTERNAL_HOSTNAME', 'uptimebot-telegram.onrender.com')
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', 300))  # 5 minutos por defecto
+
+# TU ID DE ADMIN (ÚNICO USUARIO AUTORIZADO)
+ADMIN_ID = 7970466590
 
 # Configurar logging
 logging.basicConfig(
@@ -35,408 +41,400 @@ logger = logging.getLogger(__name__)
 if not TELEGRAM_TOKEN:
     logger.error("❌ TELEGRAM_TOKEN no está configurado!")
     exit(1)
-if not UPTIME_API_KEY:
-    logger.error("❌ UPTIME_API_KEY no está configurada!")
-    exit(1)
 
-# ===== BASE DE DATOS PARA CONFIGURACIÓN =====
+# ===== BASE DE DATOS =====
 def init_db():
     """Inicializa la base de datos SQLite"""
     conn = sqlite3.connect('bot_config.db')
     c = conn.cursor()
     
-    # Tabla de configuración de usuarios
-    c.execute('''CREATE TABLE IF NOT EXISTS user_config
-                 (user_id INTEGER PRIMARY KEY,
+    # Tabla de monitores personalizados (no Uptime Robot)
+    c.execute('''CREATE TABLE IF NOT EXISTS custom_monitors
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  url TEXT UNIQUE,
+                  name TEXT,
+                  port INTEGER DEFAULT 80,
                   check_interval INTEGER DEFAULT 300,
-                  notifications_enabled INTEGER DEFAULT 1,
-                  notify_on_down INTEGER DEFAULT 1,
-                  notify_on_up INTEGER DEFAULT 1,
-                  notify_on_pause INTEGER DEFAULT 0,
-                  last_check TIMESTAMP)''')
-    
-    # Tabla de estado de monitores (para evitar notificaciones duplicadas)
-    c.execute('''CREATE TABLE IF NOT EXISTS monitor_status
-                 (monitor_id INTEGER,
-                  user_id INTEGER,
+                  last_check TIMESTAMP,
                   last_status INTEGER,
-                  last_notification TIMESTAMP,
-                  PRIMARY KEY (monitor_id, user_id))''')
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Tabla de logs de ping
+    c.execute('''CREATE TABLE IF NOT EXISTS ping_logs
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  host TEXT,
+                  response_time REAL,
+                  status TEXT,
+                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Tabla de escaneo de puertos
+    c.execute('''CREATE TABLE IF NOT EXISTS port_scans
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  host TEXT,
+                  port INTEGER,
+                  service TEXT,
+                  status TEXT,
+                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Tabla de configuración
+    c.execute('''CREATE TABLE IF NOT EXISTS config
+                 (key TEXT PRIMARY KEY,
+                  value TEXT)''')
     
     conn.commit()
     conn.close()
 
-def get_user_config(user_id):
-    """Obtiene la configuración de un usuario"""
-    conn = sqlite3.connect('bot_config.db')
-    c = conn.cursor()
-    c.execute("SELECT * FROM user_config WHERE user_id = ?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    
-    if result:
-        return {
-            'user_id': result[0],
-            'check_interval': result[1],
-            'notifications_enabled': bool(result[2]),
-            'notify_on_down': bool(result[3]),
-            'notify_on_up': bool(result[4]),
-            'notify_on_pause': bool(result[5]),
-            'last_check': result[6]
-        }
+# ===== FUNCIONES DE UTILIDAD =====
+def is_admin(user_id):
+    """Verifica si el usuario es el admin"""
+    return user_id == ADMIN_ID
+
+def format_time(seconds):
+    """Formatea tiempo en segundos a texto legible"""
+    if seconds < 60:
+        return f"{seconds} seg"
+    elif seconds < 3600:
+        return f"{seconds//60} min"
+    elif seconds < 86400:
+        return f"{seconds//3600} h"
     else:
-        # Configuración por defecto
-        default_config = {
-            'user_id': user_id,
-            'check_interval': 300,
-            'notifications_enabled': True,
-            'notify_on_down': True,
-            'notify_on_up': True,
-            'notify_on_pause': False,
-            'last_check': None
+        return f"{seconds//86400} d"
+
+def get_status_emoji(status):
+    """Convierte estado a emoji"""
+    if status == 200:
+        return "✅"
+    elif status >= 400:
+        return "❌"
+    elif status == -1:
+        return "⏳"
+    else:
+        return "⚠️"
+
+# ===== FUNCIONES DE MONITOREO PERSONALIZADO =====
+def check_website(url):
+    """Verifica si un sitio web está funcionando"""
+    try:
+        start_time = time.time()
+        response = requests.get(url, timeout=10, allow_redirects=True)
+        response_time = round((time.time() - start_time) * 1000)  # ms
+        return {
+            'status': response.status_code,
+            'time': response_time,
+            'online': response.status_code < 400
         }
-        save_user_config(user_id, default_config)
-        return default_config
+    except requests.exceptions.Timeout:
+        return {'status': 408, 'time': None, 'online': False}
+    except requests.exceptions.ConnectionError:
+        return {'status': -1, 'time': None, 'online': False}
+    except Exception as e:
+        return {'status': -2, 'time': None, 'online': False}
 
-def save_user_config(user_id, config):
-    """Guarda la configuración de un usuario"""
-    conn = sqlite3.connect('bot_config.db')
-    c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO user_config 
-                 (user_id, check_interval, notifications_enabled, notify_on_down, notify_on_up, notify_on_pause, last_check)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
-              (user_id, config['check_interval'], int(config['notifications_enabled']),
-               int(config['notify_on_down']), int(config['notify_on_up']),
-               int(config['notify_on_pause']), config['last_check']))
-    conn.commit()
-    conn.close()
+def ping_host(host):
+    """Ping a un host"""
+    try:
+        start = time.time()
+        response = subprocess.run(['ping', '-c', '1', '-W', '2', host], 
+                                 capture_output=True, text=True, timeout=5)
+        elapsed = round((time.time() - start) * 1000)
+        
+        if response.returncode == 0:
+            return {'success': True, 'time': elapsed, 'output': response.stdout}
+        else:
+            return {'success': False, 'time': None, 'output': response.stderr}
+    except Exception as e:
+        return {'success': False, 'time': None, 'error': str(e)}
 
-def update_monitor_status(monitor_id, user_id, status):
-    """Actualiza el estado de un monitor para un usuario"""
-    conn = sqlite3.connect('bot_config.db')
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute('''INSERT OR REPLACE INTO monitor_status
-                 (monitor_id, user_id, last_status, last_notification)
-                 VALUES (?, ?, ?, ?)''',
-              (monitor_id, user_id, status, now))
-    conn.commit()
-    conn.close()
+def scan_ports(host, ports=[21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080]):
+    """Escanea puertos comunes en un host"""
+    results = []
+    for port in ports:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex((host, port))
+            if result == 0:
+                try:
+                    service = socket.getservbyport(port)
+                except:
+                    service = "unknown"
+                results.append({'port': port, 'status': 'open', 'service': service})
+            sock.close()
+        except:
+            pass
+    return results
 
-def get_monitor_status(monitor_id, user_id):
-    """Obtiene el último estado conocido de un monitor"""
-    conn = sqlite3.connect('bot_config.db')
-    c = conn.cursor()
-    c.execute("SELECT last_status FROM monitor_status WHERE monitor_id = ? AND user_id = ?",
-              (monitor_id, user_id))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else None
+def check_ssl_cert(host):
+    """Verifica certificado SSL"""
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as ssock:
+                cert = ssock.getpeercert()
+                expires = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                days_left = (expires - datetime.now()).days
+                return {
+                    'valid': True,
+                    'issuer': dict(x[0] for x in cert['issuer']),
+                    'expires': expires,
+                    'days_left': days_left
+                }
+    except Exception as e:
+        return {'valid': False, 'error': str(e)}
 
-# ===== FUNCIÓN DE NOTIFICACIONES EN SEGUNDO PLANO =====
+def check_domain(domain):
+    """Obtiene información WHOIS del dominio"""
+    try:
+        w = whois.whois(domain)
+        return {
+            'registrar': w.registrar,
+            'creation_date': w.creation_date,
+            'expiration_date': w.expiration_date,
+            'name_servers': w.name_servers
+        }
+    except:
+        return None
+
+# ===== FUNCIÓN DE NOTIFICACIONES =====
 def notification_worker():
-    """Hilo que verifica el estado de los monitores y envía notificaciones"""
+    """Hilo que verifica monitores y envía notificaciones"""
     while True:
         try:
-            # Obtener todos los usuarios con notificaciones activadas
-            conn = sqlite3.connect('bot_config.db')
-            c = conn.cursor()
-            c.execute("SELECT user_id, check_interval FROM user_config WHERE notifications_enabled = 1")
-            users = c.fetchall()
-            conn.close()
+            # Obtener monitores de Uptime Robot
+            response = requests.post(
+                f'{UPTIME_API_URL}/getMonitors',
+                data={
+                    'api_key': UPTIME_API_KEY,
+                    'format': 'json',
+                    'logs': 1
+                },
+                timeout=30
+            )
             
-            for user_id, interval in users:
-                # Verificar si es momento de revisar (cada usuario tiene su intervalo)
-                user_config = get_user_config(user_id)
-                last_check = user_config['last_check']
+            data = response.json()
+            
+            if data.get('stat') == 'ok':
+                monitors = data.get('monitors', [])
                 
-                if last_check:
-                    last_check_time = datetime.fromisoformat(last_check)
-                    if datetime.now() - last_check_time < timedelta(seconds=interval):
-                        continue
-                
-                # Obtener monitores de Uptime Robot
-                response = requests.post(
-                    f'{UPTIME_API_URL}/getMonitors',
-                    data={
-                        'api_key': UPTIME_API_KEY,
-                        'format': 'json'
-                    },
-                    timeout=30
-                )
-                
-                data = response.json()
-                
-                if data.get('stat') == 'ok':
-                    monitors = data.get('monitors', [])
+                if monitors:
+                    # Verificar cambios de estado
+                    conn = sqlite3.connect('bot_config.db')
+                    c = conn.cursor()
                     
                     for monitor in monitors:
                         monitor_id = monitor['id']
                         current_status = monitor['status']
-                        last_status = get_monitor_status(monitor_id, user_id)
                         
-                        # Si el estado cambió, enviar notificación
+                        c.execute("SELECT last_status FROM monitor_status WHERE monitor_id = ?", (monitor_id,))
+                        result = c.fetchone()
+                        last_status = result[0] if result else None
+                        
                         if last_status is not None and last_status != current_status:
-                            should_notify = False
+                            # Estado cambiado - enviar notificación
+                            emoji = "✅" if current_status == 2 else "❌" if current_status == 9 else "⚠️"
+                            status_text = "ONLINE" if current_status == 2 else "OFFLINE" if current_status == 9 else "DESCONOCIDO"
                             
-                            if current_status == 2 and user_config['notify_on_up']:  # Online
-                                should_notify = True
-                                message = f"✅ *{monitor['friendly_name']} está ONLINE*\n\nLa web ha vuelto a funcionar."
-                            elif current_status == 9 and user_config['notify_on_down']:  # Offline
-                                should_notify = True
-                                message = f"❌ *{monitor['friendly_name']} está OFFLINE*\n\nLa web no responde. ¡Revisa!"
-                            elif current_status == 0 and user_config['notify_on_pause']:  # Pausado
-                                should_notify = True
-                                message = f"⏸ *{monitor['friendly_name']} está PAUSADO*\n\nEl monitoreo ha sido pausado."
+                            message = (
+                                f"🚨 *ALERTA DE MONITOREO*\n\n"
+                                f"{emoji} *{monitor['friendly_name']}*\n"
+                                f"📌 ID: `{monitor_id}`\n"
+                                f"🌐 URL: {monitor['url']}\n"
+                                f"📊 Estado: {status_text}\n\n"
+                                f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+                            )
                             
-                            if should_notify:
-                                try:
-                                    # Enviar notificación a Telegram
-                                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                                    payload = {
-                                        'chat_id': user_id,
-                                        'text': message,
-                                        'parse_mode': 'Markdown'
-                                    }
-                                    requests.post(url, data=payload, timeout=10)
-                                    logger.info(f"✅ Notificación enviada a {user_id} para monitor {monitor_id}")
-                                except Exception as e:
-                                    logger.error(f"❌ Error enviando notificación: {e}")
+                            # Enviar a Telegram
+                            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                            payload = {
+                                'chat_id': ADMIN_ID,
+                                'text': message,
+                                'parse_mode': 'Markdown'
+                            }
+                            requests.post(url, data=payload, timeout=10)
                         
-                        # Actualizar estado en BD
-                        update_monitor_status(monitor_id, user_id, current_status)
-                
-                # Actualizar último check del usuario
-                user_config['last_check'] = datetime.now().isoformat()
-                save_user_config(user_id, user_config)
-                
+                        # Actualizar estado
+                        c.execute('''INSERT OR REPLACE INTO monitor_status 
+                                   (monitor_id, last_status, last_check) 
+                                   VALUES (?, ?, ?)''',
+                                (monitor_id, current_status, datetime.now().isoformat()))
+                    
+                    conn.commit()
+                    conn.close()
+            
         except Exception as e:
             logger.error(f"❌ Error en notification_worker: {e}")
         
-        # Esperar 30 segundos antes de la próxima verificación
-        time.sleep(30)
+        time.sleep(60)  # Revisar cada minuto
 
-# ===== FUNCIÓN PARA MANTENER EL BOT DESPIERTO =====
+# ===== FUNCIÓN DE AUTO-PING =====
 def keep_alive():
-    """Mantiene el servicio despierto haciéndose ping a sí mismo"""
+    """Mantiene el servicio despierto"""
     url = f"https://{RENDER_URL}"
     while True:
         try:
-            response = requests.get(url, timeout=30)
-            logger.info(f"✅ Auto-ping exitoso a {url} - Status: {response.status_code}")
-        except Exception as e:
-            logger.error(f"❌ Error en auto-ping: {e}")
-        time.sleep(480)  # Cada 8 minutos
+            requests.get(url, timeout=30)
+        except:
+            pass
+        time.sleep(480)
 
-# ===== FUNCIONES AUXILIARES =====
-def get_status_emoji(status):
-    """Convierte el código de estado a emoji"""
-    status_map = {
-        0: ('⏸️', 'Pausado', '⚪'),
-        1: ('🔄', 'Iniciando', '🟡'),
-        2: ('✅', 'Online', '🟢'),
-        8: ('⚠️', 'Parece offline', '🟠'),
-        9: ('❌', 'Offline', '🔴')
-    }
-    return status_map.get(status, ('❓', 'Desconocido', '⚫'))
-
-def format_interval(seconds):
-    """Formatea segundos a texto legible"""
-    if seconds < 60:
-        return f"{seconds} segundos"
-    elif seconds < 3600:
-        return f"{seconds // 60} minutos"
-    else:
-        return f"{seconds // 3600} horas"
-
-def create_main_menu():
-    """Crea el teclado del menú principal"""
+# ===== PANEL PRINCIPAL ESTÉTICO =====
+def create_main_panel():
+    """Crea el panel principal con botones estéticos"""
     keyboard = [
-        [InlineKeyboardButton("📊 Ver Estado", callback_data='status')],
-        [InlineKeyboardButton("➕ Añadir Web", callback_data='add_web'),
-         InlineKeyboardButton("❌ Eliminar Web", callback_data='delete_web')],
-        [InlineKeyboardButton("🔔 Configurar Notificaciones", callback_data='notification_settings'),
-         InlineKeyboardButton("⚙️ Ajustes Generales", callback_data='settings')],
-        [InlineKeyboardButton("❓ Ayuda", callback_data='help')]
+        [InlineKeyboardButton("🌐 MONITOREAR WEB", callback_data='add_web')],
+        [InlineKeyboardButton("📊 ESTADO DE WEBS", callback_data='status')],
+        [InlineKeyboardButton("📈 MÉTRICAS", callback_data='metrics')],
+        [InlineKeyboardButton("🏓 PING", callback_data='ping')],
+        [InlineKeyboardButton("🔍 ESCANEAR PUERTOS", callback_data='ports')],
+        [InlineKeyboardButton("✅ VERIFICAR WEB", callback_data='isup')],
+        [InlineKeyboardButton("🔐 SSL CERTIFICADO", callback_data='ssl_check')],
+        [InlineKeyboardButton("🌍 INFO DOMINIO", callback_data='domain_info')],
+        [InlineKeyboardButton("⚙️ EDITAR WEBS", callback_data='edit_web')],
+        [InlineKeyboardButton("❌ CANCELAR", callback_data='cancel')],
+        [InlineKeyboardButton("🆘 AYUDA", callback_data='help')]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def create_back_button():
-    """Crea botón de volver"""
-    keyboard = [[InlineKeyboardButton("🔙 Volver al Menú", callback_data='menu')]]
-    return InlineKeyboardMarkup(keyboard)
+def create_cancel_button():
+    """Botón de cancelar"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ CANCELAR", callback_data='cancel')]])
 
 # ===== HANDLERS PRINCIPALES =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start - Muestra menú principal"""
-    user = update.effective_user
-    user_id = user.id
+    """Comando /start - Muestra panel principal"""
+    user_id = update.effective_user.id
     
-    # Inicializar configuración del usuario
-    get_user_config(user_id)
+    # Verificar si es admin
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ No estás autorizado para usar este bot.")
+        return
     
-    welcome_msg = (
-        f"🤖 *Bienvenido {user.first_name}!*\n\n"
-        "Soy tu asistente de monitoreo de Uptime Robot\n\n"
-        "🔍 *Características:*\n"
-        "• Notificaciones automáticas cuando una web cae o sube\n"
-        "• Configuración personalizada del intervalo de chequeo\n"
-        "• Elegir qué eventos notificar\n"
-        "• Ver estado en tiempo real\n"
-        "• Añadir/eliminar monitores\n\n"
-        "Selecciona una opción del menú:"
+    welcome = (
+        "🤖 *WATCH BOT - PANEL DE CONTROL*\n\n"
+        "👤 *Admin:* `@CaddisFly`\n"
+        "🆔 *Tu ID:* `7970466590`\n\n"
+        "📋 *COMANDOS DISPONIBLES:*\n"
+        "─────────────────\n"
+        "🌐 `/add` - Monitorear nueva web\n"
+        "⚙️ `/edit` - Editar configuración\n"
+        "📊 `/status` - Estado de webs\n"
+        "📈 `/metrics` - Métricas de respuesta\n"
+        "🏓 `/ping` - Ping a un host\n"
+        "🔍 `/ports` - Escanear puertos\n"
+        "✅ `/isup` - Verificar si está online\n"
+        "🔐 `/ssl` - Ver certificado SSL\n"
+        "🌍 `/domain` - Info WHOIS\n"
+        "❌ `/cancel` - Cancelar comando\n"
+        "🆘 `/help` - Mostrar ayuda\n\n"
+        "─────────────────\n"
+        "👇 *SELECCIONA UNA OPCIÓN:*"
     )
-    await update.message.reply_text(welcome_msg, parse_mode='Markdown', reply_markup=create_main_menu())
-
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Vuelve al menú principal"""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "📌 *Menú Principal*\n\nSelecciona una opción:",
-        parse_mode='Markdown',
-        reply_markup=create_main_menu()
-    )
+    
+    await update.message.reply_text(welcome, parse_mode='Markdown', reply_markup=create_main_panel())
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja los botones del menú"""
+    """Maneja los botones del panel"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'status':
-        await show_status(query, context)
-    elif query.data == 'add_web':
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ No autorizado")
+        return
+    
+    if query.data == 'add_web':
         await query.edit_message_text(
-            "🌐 *Añadir Nueva Web*\n\n"
-            "Envía la URL que deseas monitorear.\n"
-            "Ejemplo: `https://ejemplo.com`\n\n"
-            "También puedes añadir un nombre personalizado:\n"
-            "`https://ejemplo.com Mi Web`",
+            "🌐 *AÑADIR WEB A MONITOREAR*\n\n"
+            "Envía la URL completa:\n"
+            "`https://ejemplo.com`\n\n"
+            "O con nombre personalizado:\n"
+            "`https://ejemplo.com Mi Sitio`",
             parse_mode='Markdown',
-            reply_markup=create_back_button()
+            reply_markup=create_cancel_button()
         )
-        context.user_data['waiting_for_url'] = True
-    elif query.data == 'delete_web':
-        await show_delete_menu(query, context)
-    elif query.data == 'notification_settings':
-        await show_notification_settings(query, context)
-    elif query.data == 'settings':
-        await show_settings(query, context)
+        context.user_data['awaiting'] = 'add_web'
+    
+    elif query.data == 'status':
+        await show_status(query, context)
+    
+    elif query.data == 'metrics':
+        await query.edit_message_text(
+            "📈 *MÉTRICAS DE RESPUESTA*\n\n"
+            "Envía la URL para ver métricas:",
+            parse_mode='Markdown',
+            reply_markup=create_cancel_button()
+        )
+        context.user_data['awaiting'] = 'metrics'
+    
+    elif query.data == 'ping':
+        await query.edit_message_text(
+            "🏓 *PING A HOST*\n\n"
+            "Envía el host o IP para hacer ping:\n"
+            "`google.com`\n"
+            "`8.8.8.8`",
+            parse_mode='Markdown',
+            reply_markup=create_cancel_button()
+        )
+        context.user_data['awaiting'] = 'ping'
+    
+    elif query.data == 'ports':
+        await query.edit_message_text(
+            "🔍 *ESCANEAR PUERTOS*\n\n"
+            "Envía el host o IP para escanear:\n"
+            "`ejemplo.com`\n"
+            "`192.168.1.1`",
+            parse_mode='Markdown',
+            reply_markup=create_cancel_button()
+        )
+        context.user_data['awaiting'] = 'ports'
+    
+    elif query.data == 'isup':
+        await query.edit_message_text(
+            "✅ *VERIFICAR WEB*\n\n"
+            "Envía la URL para verificar:\n"
+            "`https://ejemplo.com`",
+            parse_mode='Markdown',
+            reply_markup=create_cancel_button()
+        )
+        context.user_data['awaiting'] = 'isup'
+    
+    elif query.data == 'ssl_check':
+        await query.edit_message_text(
+            "🔐 *VERIFICAR SSL*\n\n"
+            "Envía el dominio para ver certificado:\n"
+            "`ejemplo.com`",
+            parse_mode='Markdown',
+            reply_markup=create_cancel_button()
+        )
+        context.user_data['awaiting'] = 'ssl'
+    
+    elif query.data == 'domain_info':
+        await query.edit_message_text(
+            "🌍 *INFO DEL DOMINIO*\n\n"
+            "Envía el dominio para información WHOIS:\n"
+            "`ejemplo.com`",
+            parse_mode='Markdown',
+            reply_markup=create_cancel_button()
+        )
+        context.user_data['awaiting'] = 'domain'
+    
+    elif query.data == 'edit_web':
+        await show_edit_menu(query, context)
+    
+    elif query.data == 'cancel':
+        await query.edit_message_text(
+            "❌ Comando cancelado.\n\nVolviendo al panel...",
+            reply_markup=create_main_panel()
+        )
+        context.user_data.clear()
+    
     elif query.data == 'help':
         await show_help(query, context)
-    elif query.data.startswith('delete_'):
-        monitor_id = query.data.replace('delete_', '')
-        await confirm_delete(query, context, monitor_id)
-    elif query.data.startswith('set_interval_'):
-        interval = int(query.data.replace('set_interval_', ''))
-        await set_interval(query, context, interval)
-    elif query.data.startswith('toggle_'):
-        setting = query.data.replace('toggle_', '')
-        await toggle_setting(query, context, setting)
-    elif query.data.startswith('confirm_delete_'):
-        monitor_id = query.data.replace('confirm_delete_', '')
-        await execute_delete(query, context, monitor_id)
 
-# ===== FUNCIONES DE NOTIFICACIONES =====
-async def show_notification_settings(query, context):
-    """Muestra la configuración de notificaciones"""
-    user_id = query.from_user.id
-    config = get_user_config(user_id)
-    
-    # Crear botones para cada configuración
-    keyboard = [
-        [InlineKeyboardButton(
-            f"{'✅' if config['notifications_enabled'] else '❌'} Notificaciones Activadas",
-            callback_data='toggle_notifications_enabled'
-        )],
-        [InlineKeyboardButton(
-            f"{'✅' if config['notify_on_down'] else '❌'} Notificar cuando caiga",
-            callback_data='toggle_notify_on_down'
-        )],
-        [InlineKeyboardButton(
-            f"{'✅' if config['notify_on_up'] else '❌'} Notificar cuando suba",
-            callback_data='toggle_notify_on_up'
-        )],
-        [InlineKeyboardButton(
-            f"{'✅' if config['notify_on_pause'] else '❌'} Notificar cuando pause",
-            callback_data='toggle_notify_on_pause'
-        )],
-        [InlineKeyboardButton("⏱ Configurar Intervalo", callback_data='show_interval_menu')],
-        [InlineKeyboardButton("🔙 Volver", callback_data='menu')]
-    ]
-    
-    message = (
-        "🔔 *Configuración de Notificaciones*\n\n"
-        f"Estado actual:\n"
-        f"• Notificaciones: {'Activadas' if config['notifications_enabled'] else 'Desactivadas'}\n"
-        f"• Notificar caídas: {'Sí' if config['notify_on_down'] else 'No'}\n"
-        f"• Notificar recuperación: {'Sí' if config['notify_on_up'] else 'No'}\n"
-        f"• Notificar pausas: {'Sí' if config['notify_on_pause'] else 'No'}\n"
-        f"• Intervalo de chequeo: {format_interval(config['check_interval'])}\n\n"
-        "Selecciona qué opción deseas cambiar:"
-    )
-    
-    await query.edit_message_text(
-        message,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def toggle_setting(query, context, setting):
-    """Activa/desactiva una configuración"""
-    user_id = query.from_user.id
-    config = get_user_config(user_id)
-    
-    # Mapear el setting al campo correspondiente
-    setting_map = {
-        'notifications_enabled': 'notifications_enabled',
-        'notify_on_down': 'notify_on_down',
-        'notify_on_up': 'notify_on_up',
-        'notify_on_pause': 'notify_on_pause'
-    }
-    
-    if setting in setting_map:
-        config[setting_map[setting]] = not config[setting_map[setting]]
-        save_user_config(user_id, config)
-    
-    # Volver a mostrar configuración actualizada
-    await show_notification_settings(query, context)
-
-async def show_interval_menu(query, context):
-    """Muestra el menú para seleccionar intervalo"""
-    keyboard = [
-        [InlineKeyboardButton("1 minuto", callback_data='set_interval_60')],
-        [InlineKeyboardButton("5 minutos", callback_data='set_interval_300')],
-        [InlineKeyboardButton("10 minutos", callback_data='set_interval_600')],
-        [InlineKeyboardButton("15 minutos", callback_data='set_interval_900')],
-        [InlineKeyboardButton("30 minutos", callback_data='set_interval_1800')],
-        [InlineKeyboardButton("1 hora", callback_data='set_interval_3600')],
-        [InlineKeyboardButton("🔙 Volver", callback_data='notification_settings')]
-    ]
-    
-    await query.edit_message_text(
-        "⏱ *Selecciona el intervalo de chequeo*\n\n"
-        "Cada cuánto tiempo quieres que el bot verifique el estado de tus webs.\n\n"
-        "*(Intervalos más cortos = notificaciones más rápidas)*",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def set_interval(query, context, interval):
-    """Configura el intervalo de chequeo"""
-    user_id = query.from_user.id
-    config = get_user_config(user_id)
-    config['check_interval'] = interval
-    save_user_config(user_id, config)
-    
-    await query.answer(f"✅ Intervalo configurado a {format_interval(interval)}")
-    await show_notification_settings(query, context)
-
-# ===== FUNCIONES DE MONITORES =====
 async def show_status(query, context):
-    """Muestra el estado de todas las webs"""
+    """Muestra estado de todas las webs"""
     try:
-        await query.edit_message_text("🔄 Consultando estado de tus webs...")
+        await query.edit_message_text("🔄 Consultando estado...")
         
         response = requests.post(
             f'{UPTIME_API_URL}/getMonitors',
@@ -444,8 +442,7 @@ async def show_status(query, context):
                 'api_key': UPTIME_API_KEY,
                 'format': 'json',
                 'logs': 1,
-                'response_times': 1,
-                'custom_uptime_ratios': 1
+                'response_times': 1
             },
             timeout=30
         )
@@ -457,90 +454,63 @@ async def show_status(query, context):
             
             if not monitors:
                 await query.message.reply_text(
-                    "📭 No tienes webs configuradas.\n\n"
-                    "Usa '➕ Añadir Web' para comenzar.",
-                    reply_markup=create_main_menu()
+                    "📭 No hay webs configuradas.",
+                    reply_markup=create_main_panel()
                 )
                 return
             
-            # Estadísticas
             total = len(monitors)
             online = sum(1 for m in monitors if m['status'] == 2)
             offline = sum(1 for m in monitors if m['status'] == 9)
-            paused = sum(1 for m in monitors if m['status'] == 0)
             
-            # Calcular uptime promedio
-            uptimes = [float(m.get('custom_uptime_ratio', 0)) for m in monitors if m.get('custom_uptime_ratio')]
-            avg_uptime = sum(uptimes) / len(uptimes) if uptimes else 0
-            
-            summary = (
-                f"📊 *RESUMEN GENERAL*\n"
-                f"┌─────────────────────\n"
-                f"│ 📌 Total: {total}\n"
-                f"│ ✅ Online: {online}\n"
-                f"│ ❌ Offline: {offline}\n"
-                f"│ ⏸️ Pausados: {paused}\n"
-                f"│ 📈 Uptime Prom: {avg_uptime:.2f}%\n"
-                f"└─────────────────────\n\n"
-                f"📋 *DETALLE POR WEB:*\n"
+            header = (
+                f"📊 *ESTADO DE WEBS*\n"
+                f"─────────────────\n"
+                f"📌 Total: {total}\n"
+                f"✅ Online: {online}\n"
+                f"❌ Offline: {offline}\n"
+                f"─────────────────\n\n"
             )
             
-            await query.message.reply_text(summary, parse_mode='Markdown')
+            await query.message.reply_text(header, parse_mode='Markdown')
             
-            # Mostrar cada monitor
             for monitor in monitors:
-                emoji, estado, color = get_status_emoji(monitor['status'])
+                emoji = "✅" if monitor['status'] == 2 else "❌" if monitor['status'] == 9 else "⚠️"
                 nombre = monitor.get('friendly_name', 'Sin nombre')
                 url = monitor.get('url', 'URL no disponible')
-                monitor_id = monitor.get('id', 'N/A')
                 
-                uptime = monitor.get('custom_uptime_ratio', 'N/A')
-                uptime_str = f"{uptime}%" if uptime != 'N/A' else 'N/A'
-                
+                # Último tiempo de respuesta
                 last_response = "N/A"
                 if monitor.get('response_times'):
                     last_response = f"{monitor['response_times'][0].get('value', 0)}ms"
                 
-                last_down = "Sin caídas"
-                if monitor.get('logs'):
-                    for log in reversed(monitor['logs']):
-                        if log.get('type') == 2:
-                            fecha = datetime.fromtimestamp(log.get('datetime', 0))
-                            last_down = fecha.strftime('%d/%m/%Y %H:%M')
-                            break
-                
-                monitor_info = (
+                msg = (
                     f"{emoji} *{nombre}*\n"
-                    f"├─ ID: `{monitor_id}`\n"
-                    f"├─ URL: {url}\n"
-                    f"├─ Estado: {estado}\n"
-                    f"├─ Uptime: {uptime_str}\n"
-                    f"├─ Respuesta: ⚡{last_response}\n"
-                    f"└─ Última caída: 📅 {last_down}\n"
+                    f"├─ URL: `{url}`\n"
+                    f"├─ ID: `{monitor['id']}`\n"
+                    f"└─ Respuesta: {last_response}\n"
                 )
                 
-                await query.message.reply_text(monitor_info, parse_mode='Markdown')
+                await query.message.reply_text(msg, parse_mode='Markdown')
             
             await query.message.reply_text(
-                "✅ *Consulta completada*\nSelecciona otra opción:",
-                parse_mode='Markdown',
-                reply_markup=create_main_menu()
+                "✅ Consulta completada",
+                reply_markup=create_main_panel()
             )
         else:
             await query.message.reply_text(
-                f"❌ Error: {data.get('error', {}).get('message', 'Error desconocido')}",
-                reply_markup=create_main_menu()
+                f"❌ Error: {data.get('error', {}).get('message', 'Error')}",
+                reply_markup=create_main_panel()
             )
             
     except Exception as e:
-        logger.error(f"Error en show_status: {e}")
         await query.message.reply_text(
-            "❌ Error al consultar el estado. Intenta de nuevo.",
-            reply_markup=create_main_menu()
+            "❌ Error al consultar",
+            reply_markup=create_main_panel()
         )
 
-async def show_delete_menu(query, context):
-    """Muestra menú para eliminar webs (VERSIÓN CORREGIDA)"""
+async def show_edit_menu(query, context):
+    """Muestra menú para editar webs"""
     try:
         response = requests.post(
             f'{UPTIME_API_URL}/getMonitors',
@@ -553,105 +523,89 @@ async def show_delete_menu(query, context):
         if data.get('stat') == 'ok' and data.get('monitors'):
             keyboard = []
             for monitor in data['monitors']:
-                emoji, estado, _ = get_status_emoji(monitor['status'])
-                nombre = monitor.get('friendly_name', 'Sin nombre')[:25]
-                callback_data = f"delete_{monitor['id']}"
+                nombre = monitor.get('friendly_name', 'Sin nombre')[:20]
                 keyboard.append([InlineKeyboardButton(
-                    f"{emoji} {nombre} (ID: {monitor['id']})", 
-                    callback_data=callback_data
+                    f"✏️ {nombre}", 
+                    callback_data=f"edit_{monitor['id']}"
                 )])
             
-            keyboard.append([InlineKeyboardButton("🔙 Cancelar", callback_data='menu')])
+            keyboard.append([InlineKeyboardButton("🔙 VOLVER", callback_data='menu')])
             
             await query.edit_message_text(
-                "🗑 *Selecciona la web a eliminar:*",
+                "✏️ *SELECCIONA WEB A EDITAR*",
                 parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
             await query.edit_message_text(
-                "📭 No hay webs para eliminar.",
-                reply_markup=create_back_button()
+                "📭 No hay webs para editar",
+                reply_markup=create_main_panel()
             )
             
     except Exception as e:
-        logger.error(f"Error en show_delete_menu: {e}")
         await query.edit_message_text(
-            "❌ Error al cargar las webs.",
-            reply_markup=create_back_button()
+            "❌ Error al cargar",
+            reply_markup=create_main_panel()
         )
 
-async def confirm_delete(query, context, monitor_id):
-    """Confirma eliminación de web"""
-    keyboard = [
-        [InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"confirm_delete_{monitor_id}")],
-        [InlineKeyboardButton("❌ No, cancelar", callback_data='delete_web')]
-    ]
+async def show_help(query, context):
+    """Muestra ayuda completa"""
+    help_text = (
+        "🆘 *AYUDA - WATCH BOT*\n\n"
+        "🤖 *COMANDOS DISPONIBLES:*\n"
+        "─────────────────\n"
+        "🌐 `/add` - Monitorear nueva web\n"
+        "⚙️ `/edit` - Editar configuración\n"
+        "📊 `/status` - Estado de webs\n"
+        "📈 `/metrics` - Métricas de respuesta\n"
+        "🏓 `/ping` - Ping a un host\n"
+        "🔍 `/ports` - Escanear puertos\n"
+        "✅ `/isup` - Verificar si está online\n"
+        "🔐 `/ssl` - Ver certificado SSL\n"
+        "🌍 `/domain` - Info WHOIS\n"
+        "❌ `/cancel` - Cancelar comando\n"
+        "🆘 `/help` - Mostrar ayuda\n\n"
+        "─────────────────\n"
+        "👤 *Admin:* `@CaddisFly`\n"
+        "📢 *Canal:* @watch_bot_news\n"
+        "💬 *Soporte:* @CaddisFly\n\n"
+        "🤝 *Donaciones:* Para mantener el bot"
+    )
+    
     await query.edit_message_text(
-        f"⚠️ *¿Estás seguro de eliminar el monitor {monitor_id}?*\n\nEsta acción no se puede deshacer.",
+        help_text,
         parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=create_main_panel()
     )
 
-async def execute_delete(query, context, monitor_id):
-    """Ejecuta la eliminación del monitor (VERSIÓN CORREGIDA)"""
-    try:
-        await query.edit_message_text(f"🔄 Eliminando monitor {monitor_id}...")
-        
-        response = requests.post(
-            f'{UPTIME_API_URL}/deleteMonitor',
-            data={
-                'api_key': UPTIME_API_KEY,
-                'format': 'json',
-                'id': monitor_id
-            },
-            timeout=30
-        )
-        
-        data = response.json()
-        
-        if data.get('stat') == 'ok':
-            await query.message.reply_text(
-                f"✅ *Monitor {monitor_id} eliminado correctamente!*",
-                parse_mode='Markdown',
-                reply_markup=create_main_menu()
-            )
-        else:
-            error_msg = data.get('error', {}).get('message', 'Error desconocido')
-            await query.message.reply_text(
-                f"❌ Error al eliminar: {error_msg}",
-                reply_markup=create_main_menu()
-            )
-            
-    except Exception as e:
-        logger.error(f"Error en execute_delete: {e}")
-        await query.message.reply_text(
-            "❌ Error de conexión al eliminar. Intenta de nuevo.",
-            reply_markup=create_main_menu()
-        )
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja mensajes de texto (para añadir URLs)"""
-    if context.user_data.get('waiting_for_url'):
-        url_input = update.message.text.strip()
-        
-        # Separar URL y nombre si se proporciona
-        parts = url_input.split(' ', 1)
+    """Maneja mensajes de texto"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ No autorizado")
+        return
+    
+    text = update.message.text.strip()
+    awaiting = context.user_data.get('awaiting')
+    
+    if awaiting == 'add_web':
+        # Añadir web a Uptime Robot
+        parts = text.split(' ', 1)
         url = parts[0]
-        friendly_name = parts[1] if len(parts) > 1 else None
+        name = parts[1] if len(parts) > 1 else url.replace('https://', '').replace('http://', '').split('/')[0]
         
         if not url.startswith(('http://', 'https://')):
             await update.message.reply_text(
-                "❌ URL inválida. Debe comenzar con http:// o https://\n\nIntenta de nuevo:",
-                reply_markup=create_back_button()
+                "❌ URL inválida. Usa http:// o https://",
+                reply_markup=create_main_panel()
             )
+            context.user_data.clear()
             return
         
+        await update.message.reply_text("🔄 Añadiendo web...")
+        
         try:
-            await update.message.reply_text(f"🔄 Añadiendo {url}...")
-            
-            nombre = friendly_name if friendly_name else url.replace('https://', '').replace('http://', '').split('/')[0]
-            
             response = requests.post(
                 f'{UPTIME_API_URL}/newMonitor',
                 data={
@@ -659,7 +613,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'format': 'json',
                     'type': '1',
                     'url': url,
-                    'friendly_name': nombre,
+                    'friendly_name': name,
                     'interval': '300'
                 },
                 timeout=30
@@ -670,122 +624,239 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if data.get('stat') == 'ok':
                 monitor = data.get('monitor', {})
                 await update.message.reply_text(
-                    f"✅ *¡Web añadida exitosamente!*\n\n"
+                    f"✅ *WEB AÑADIDA*\n\n"
                     f"📌 ID: `{monitor.get('id')}`\n"
                     f"🌐 URL: {url}\n"
-                    f"📝 Nombre: {nombre}\n"
-                    f"⏱ Intervalo: 5 minutos\n\n"
-                    f"Recibirás notificaciones cuando el estado cambie.",
+                    f"📝 Nombre: {name}\n"
+                    f"⏱ Intervalo: 5 min",
                     parse_mode='Markdown',
-                    reply_markup=create_main_menu()
+                    reply_markup=create_main_panel()
                 )
             else:
                 await update.message.reply_text(
-                    f"❌ Error: {data.get('error', {}).get('message', 'Error desconocido')}",
-                    reply_markup=create_main_menu()
+                    f"❌ Error: {data.get('error', {}).get('message', 'Error')}",
+                    reply_markup=create_main_panel()
                 )
-                
         except Exception as e:
-            logger.error(f"Error al añadir web: {e}")
             await update.message.reply_text(
-                "❌ Error al añadir la web. Intenta de nuevo.",
-                reply_markup=create_main_menu()
+                "❌ Error al añadir",
+                reply_markup=create_main_panel()
             )
         
-        context.user_data['waiting_for_url'] = False
-
-async def show_settings(query, context):
-    """Muestra configuración general"""
-    keyboard = [
-        [InlineKeyboardButton("🔔 Configurar Notificaciones", callback_data='notification_settings')],
-        [InlineKeyboardButton("📊 Ver Estadísticas", callback_data='stats')],
-        [InlineKeyboardButton("🔙 Volver", callback_data='menu')]
-    ]
+        context.user_data.clear()
     
-    await query.edit_message_text(
-        "⚙️ *Configuración General*\n\n"
-        "Aquí puedes ajustar todos los parámetros del bot.\n"
-        "Selecciona una opción:",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def show_help(query, context):
-    """Muestra ayuda"""
-    help_text = (
-        "❓ *Ayuda del Bot*\n\n"
-        "*📌 Comandos disponibles:*\n"
-        "/start - Mostrar menú principal\n\n"
-        "*🔔 Notificaciones:*\n"
-        "• Puedes configurar qué eventos notificar\n"
-        "• Elige el intervalo de chequeo (1 min a 1 hora)\n"
-        "• Recibirás mensajes automáticos cuando cambie el estado\n\n"
-        "*🌐 Añadir web:*\n"
-        "• Usa URL completa (https://ejemplo.com)\n"
-        "• Opcional: añade un nombre personalizado\n\n"
-        "*🗑 Eliminar web:*\n"
-        "• Selecciona de la lista\n"
-        "• Confirmación antes de eliminar\n\n"
-        "*📊 Estados:*\n"
-        "✅ Online - Funcionando\n"
-        "❌ Offline - Caída\n"
-        "⏸️ Pausado - Monitoreo detenido\n"
-        "🔄 Iniciando - Recién creado\n"
-        "⚠️ Revisando - Posible problema"
-    )
-    await query.edit_message_text(help_text, parse_mode='Markdown', reply_markup=create_back_button())
+    elif awaiting == 'ping':
+        await update.message.reply_text(f"🏓 Haciendo ping a {text}...")
+        
+        result = ping_host(text)
+        
+        if result['success']:
+            await update.message.reply_text(
+                f"✅ *PING EXITOSO*\n\n"
+                f"📍 Host: `{text}`\n"
+                f"⏱ Tiempo: {result['time']}ms\n\n"
+                f"```\n{result['output'][:500]}\n```",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ *PING FALLÓ*\n\n📍 Host: `{text}`",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        
+        context.user_data.clear()
+    
+    elif awaiting == 'ports':
+        await update.message.reply_text(f"🔍 Escaneando puertos en {text}...")
+        
+        results = scan_ports(text)
+        
+        if results:
+            msg = f"🔍 *PUERTOS ABIERTOS EN {text}*\n\n"
+            for r in results:
+                msg += f"├─ {r['port']}: {r['service']} (ABIERTO)\n"
+            
+            await update.message.reply_text(
+                msg,
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        else:
+            await update.message.reply_text(
+                f"🔍 No se encontraron puertos abiertos en {text}",
+                reply_markup=create_main_panel()
+            )
+        
+        context.user_data.clear()
+    
+    elif awaiting == 'isup':
+        if not text.startswith(('http://', 'https://')):
+            text = 'https://' + text
+        
+        await update.message.reply_text(f"✅ Verificando {text}...")
+        
+        result = check_website(text)
+        
+        if result['online']:
+            await update.message.reply_text(
+                f"✅ *WEB ONLINE*\n\n"
+                f"📍 URL: {text}\n"
+                f"📊 Status: {result['status']}\n"
+                f"⏱ Tiempo: {result['time']}ms",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ *WEB OFFLINE*\n\n📍 URL: {text}",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        
+        context.user_data.clear()
+    
+    elif awaiting == 'ssl':
+        await update.message.reply_text(f"🔐 Verificando SSL de {text}...")
+        
+        result = check_ssl_cert(text)
+        
+        if result['valid']:
+            color = "🟢" if result['days_left'] > 30 else "🟡" if result['days_left'] > 7 else "🔴"
+            await update.message.reply_text(
+                f"🔐 *CERTIFICADO SSL*\n\n"
+                f"📍 Dominio: {text}\n"
+                f"{color} Válido: Sí\n"
+                f"📅 Expira: {result['expires'].strftime('%d/%m/%Y')}\n"
+                f"⏱ Días restantes: {result['days_left']}\n"
+                f"🏢 Emisor: {result['issuer'].get('organizationName', 'N/A')}",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ *SSL NO VÁLIDO*\n\n📍 Dominio: {text}",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        
+        context.user_data.clear()
+    
+    elif awaiting == 'domain':
+        await update.message.reply_text(f"🌍 Obteniendo info de {text}...")
+        
+        info = check_domain(text)
+        
+        if info:
+            creation = info['creation_date'][0] if isinstance(info['creation_date'], list) else info['creation_date']
+            expiration = info['expiration_date'][0] if isinstance(info['expiration_date'], list) else info['expiration_date']
+            
+            await update.message.reply_text(
+                f"🌍 *INFO DEL DOMINIO*\n\n"
+                f"📍 Dominio: {text}\n"
+                f"📅 Creado: {creation.strftime('%d/%m/%Y') if creation else 'N/A'}\n"
+                f"⏱ Expira: {expiration.strftime('%d/%m/%Y') if expiration else 'N/A'}\n"
+                f"🏢 Registrar: {info['registrar'] or 'N/A'}\n\n"
+                f"📋 Nameservers:\n"
+                f"{chr(10).join(['├─ ' + ns for ns in (info['name_servers'] or [])[:3]])}",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ No se pudo obtener info de {text}",
+                reply_markup=create_main_panel()
+            )
+        
+        context.user_data.clear()
+    
+    elif awaiting == 'metrics':
+        if not text.startswith(('http://', 'https://')):
+            text = 'https://' + text
+        
+        await update.message.reply_text(f"📈 Obteniendo métricas de {text}...")
+        
+        # Simular métricas con 5 pings
+        times = []
+        for i in range(5):
+            result = check_website(text)
+            if result['time']:
+                times.append(result['time'])
+            time.sleep(1)
+        
+        if times:
+            avg = sum(times) / len(times)
+            max_t = max(times)
+            min_t = min(times)
+            
+            await update.message.reply_text(
+                f"📈 *MÉTRICAS DE RESPUESTA*\n\n"
+                f"📍 URL: {text}\n"
+                f"─────────────────\n"
+                f"📊 Promedio: {avg:.0f}ms\n"
+                f"📈 Máximo: {max_t}ms\n"
+                f"📉 Mínimo: {min_t}ms\n"
+                f"📋 Muestras: {len(times)}\n"
+                f"─────────────────",
+                parse_mode='Markdown',
+                reply_markup=create_main_panel()
+            )
+        else:
+            await update.message.reply_text(
+                "❌ No se pudieron obtener métricas",
+                reply_markup=create_main_panel()
+            )
+        
+        context.user_data.clear()
 
 async def post_init(application: Application):
-    """Función que se ejecuta después de inicializar la aplicación"""
-    logger.info("🤖 Bot iniciado correctamente!")
-    logger.info(f"📱 Busca tu bot en Telegram")
-    logger.info(f"🌐 Webhook configurado en: https://{RENDER_URL}/{TELEGRAM_TOKEN}")
-    logger.info(f"⏱ Sistema de notificaciones activado (intervalo configurable por usuario)")
+    """Post initialization"""
+    logger.info("🤖 WATCH BOT iniciado!")
+    logger.info(f"👤 Admin ID: {ADMIN_ID}")
+    logger.info("🔔 Notificaciones activadas")
 
 def main():
     """Función principal"""
     try:
-        # Inicializar base de datos
+        # Inicializar BD
         init_db()
-        logger.info("✅ Base de datos inicializada")
         
-        # Iniciar el hilo de auto-ping
+        # Iniciar hilos
         threading.Thread(target=keep_alive, daemon=True).start()
-        logger.info("🔄 Sistema de auto-ping iniciado (cada 8 minutos)")
-        
-        # Iniciar el hilo de notificaciones
         threading.Thread(target=notification_worker, daemon=True).start()
-        logger.info("🔔 Sistema de notificaciones iniciado")
         
-        # Crear la aplicación
-        application = (
-            Application.builder()
-            .token(TELEGRAM_TOKEN)
-            .post_init(post_init)
-            .concurrent_updates(True)
-            .build()
-        )
+        # Crear aplicación
+        application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
         
         # Handlers
         application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("add", lambda u,c: start(u,c)))  # Redirigir a /start
+        application.add_handler(CommandHandler("edit", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("status", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("metrics", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("ping", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("ports", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("isup", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("ssl", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("domain", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("cancel", lambda u,c: start(u,c)))
+        application.add_handler(CommandHandler("help", lambda u,c: start(u,c)))
         application.add_handler(CallbackQueryHandler(button_handler))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        # Configurar webhook para Render
+        # Webhook para Render
         webhook_url = f"https://{RENDER_URL}/{TELEGRAM_TOKEN}"
-        logger.info(f"🔗 Configurando webhook en: {webhook_url}")
         
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=TELEGRAM_TOKEN,
-            webhook_url=webhook_url,
-            secret_token=None,
-            allowed_updates=['message', 'callback_query']
+            webhook_url=webhook_url
         )
         
     except Exception as e:
-        logger.error(f"❌ Error al iniciar: {e}")
+        logger.error(f"❌ Error: {e}")
 
 if __name__ == '__main__':
     main()

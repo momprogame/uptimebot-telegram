@@ -3,3 +3,4 @@ requests
 python-dotenv
 httpcore
 httpx
+whois
